@@ -62,6 +62,8 @@ class CommvaultClient:
         transport = None
         if proxy:
             from httpx_socks import AsyncProxyTransport
+            # httpx-socks supports socks5/socks4 but not socks5h — normalize
+            proxy = proxy.replace("socks5h://", "socks5://").replace("socks4a://", "socks4://")
             transport = AsyncProxyTransport.from_url(proxy)
 
         self._http = httpx.AsyncClient(
@@ -81,6 +83,7 @@ class CommvaultClient:
         resp = await self._http.post(
             f"{self.base_url}/SearchSvc/CVWebService.svc/Login",
             json={"username": self.username, "password": pwd_b64},
+            headers={"Accept": "application/json"},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -120,18 +123,13 @@ class CommvaultClient:
             params["jobFilter"] = status
 
         data = await self._get("/Job", params)
-        jobs = data.get("jobs", {})
-        if isinstance(jobs, dict):
-            return jobs.get("jobSummary", [])
-        return []
+        return [item["jobSummary"] for item in data.get("jobs", []) if "jobSummary" in item]
 
     async def get_job_details(self, job_id: int) -> dict:
         data = await self._get(f"/Job/{job_id}")
-        jobs = data.get("jobs", {})
-        if isinstance(jobs, dict):
-            summaries = jobs.get("jobSummary", [])
-            if summaries:
-                return summaries[0]
+        items = data.get("jobs", [])
+        if items and "jobSummary" in items[0]:
+            return items[0]["jobSummary"]
         return {}
 
     async def list_events(
@@ -148,7 +146,7 @@ class CommvaultClient:
             params["level"] = level
 
         data = await self._get("/Events", params)
-        events = data.get("commservEvents", {}).get("commservEvent", [])
+        events = data.get("commservEvents", [])
 
         if error_code:
             events = [e for e in events if error_code in e.get("description", "")]
@@ -176,8 +174,7 @@ class CommvaultClient:
 
     async def get_media_agents(self) -> list[dict]:
         data = await self._get("/MediaAgent")
-        agents = data.get("mediaAgentList", [])
-        return agents if isinstance(agents, list) else []
+        return data.get("response", [])
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -192,8 +189,9 @@ def _fmt_jobs(jobs: list[dict]) -> str:
         return "(no jobs found)"
     lines = []
     for j in jobs:
+        client = (j.get("subclient") or {}).get("clientName") or j.get("clientName", "?")
         lines.append(
-            f"[{j.get('jobId','?')}] {j.get('clientName','?')} / {j.get('subclientName','?')} "
+            f"[{j.get('jobId','?')}] {client} / {j.get('subclientName','?')} "
             f"| {j.get('jobType','?')} | {j.get('status','?')} "
             f"| started: {j.get('jobStartTime','?')}"
         )
@@ -231,9 +229,9 @@ def _fmt_agents(agents: list[dict]) -> str:
         return "(no media agents found)"
     lines = []
     for a in agents:
-        name = a.get("mediaAgent", {}).get("mediaAgentName", "?")
-        status = a.get("status", "?")
-        lines.append(f"{name} | status: {status}")
+        info = a.get("entityInfo", {})
+        name = info.get("name", "?")
+        lines.append(f"[{info.get('id','?')}] {name}")
     return "\n".join(lines)
 
 
