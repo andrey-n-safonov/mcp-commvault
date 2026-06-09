@@ -181,6 +181,114 @@ class CommvaultClient:
         data = await self._get("/MediaAgent")
         return data.get("response", [])
 
+    async def list_subclients(
+        self,
+        client_name: str = "",
+        app_type: str = "",
+    ) -> list[dict]:
+        # Get all clients, filter by name, then fetch subclients per client
+        data = await self._get("/Client")
+        all_clients = data.get("clientProperties", [])
+
+        if client_name:
+            needle = client_name.lower()
+            all_clients = [
+                c for c in all_clients
+                if needle in (c.get("client", {}).get("clientEntity", {})
+                               .get("clientName", "")).lower()
+                or needle in (c.get("client", {}).get("clientEntity", {})
+                               .get("displayName", "")).lower()
+            ]
+
+        results: list[dict] = []
+        for c in all_clients:
+            entity = c.get("client", {}).get("clientEntity", {})
+            cid = entity.get("clientId")
+            cname = entity.get("clientName", "?")
+            if not cid:
+                continue
+            sub_data = await self._get("/Subclient", {"clientId": cid})
+            subs = sub_data.get("subClientProperties", [])
+            for s in subs:
+                e = s.get("subClientEntity", {})
+                if app_type and app_type.lower() not in e.get("appName", "").lower():
+                    continue
+                sp = (s.get("commonProperties", {})
+                      .get("storageDevice", {})
+                      .get("dataBackupStoragePolicy", {})
+                      .get("storagePolicyName", ""))
+                results.append({
+                    "clientName": cname,
+                    "subclientId": e.get("subclientId"),
+                    "subclientName": e.get("subclientName"),
+                    "backupsetName": e.get("backupsetName"),
+                    "appName": e.get("appName"),
+                    "storagePolicyName": sp,
+                })
+        return results
+
+    async def list_schedule_policies(
+        self,
+        name_filter: str = "",
+        app_type_id: int = 0,
+    ) -> list[dict]:
+        data = await self._get("/SchedulePolicy")
+        items = data.get("taskDetail", [])
+        results = []
+        for item in items:
+            task = item.get("task", {})
+            tname = task.get("taskName", "")
+            if name_filter and name_filter.lower() not in tname.lower():
+                continue
+            app_types = [
+                a.get("appTypeId")
+                for a in item.get("appGroup", {}).get("appTypes", [])
+            ]
+            if app_type_id and app_type_id not in app_types:
+                continue
+            results.append({
+                "taskId": task.get("taskId"),
+                "taskName": tname,
+                "description": task.get("description", ""),
+                "appTypeIds": app_types,
+                "associatedObjects": task.get("associatedObjects", 0),
+                "disabled": task.get("taskFlags", {}).get("disabled", False),
+            })
+        return results
+
+    async def get_schedule_policy_details(self, task_id: int) -> dict:
+        data = await self._get(f"/SchedulePolicy/{task_id}")
+        ti = data.get("taskInfo", {})
+        task = ti.get("task", {})
+        subtasks = ti.get("subTasks", [])
+        schedules = []
+        for st in subtasks:
+            pattern = st.get("pattern", {})
+            opts = st.get("options", {})
+            backup_opts = opts.get("backupOpts", {})
+            schedules.append({
+                "subTaskName": st.get("subTask", {}).get("subTaskName", ""),
+                "schedule": pattern.get("description", ""),
+                "backupLevel": backup_opts.get("backupLevel", ""),
+            })
+        return {
+            "taskId": task.get("taskId"),
+            "taskName": task.get("taskName", ""),
+            "description": task.get("description", ""),
+            "schedules": schedules,
+        }
+
+    async def get_client_jobs_summary(self, hours_back: int = 48) -> list[dict]:
+        jobs = await self.list_jobs(hours_back=hours_back, limit=200)
+        # Group by client, keep latest job per client
+        by_client: dict[str, dict] = {}
+        for j in jobs:
+            cname = (j.get("subclient") or {}).get("clientName") or "?"
+            existing = by_client.get(cname)
+            if not existing or j.get("jobStartTime", 0) > existing.get("jobStartTime", 0):
+                by_client[cname] = j
+        return sorted(by_client.values(), key=lambda x: x.get("jobStartTime", 0), reverse=True)
+
     async def close(self) -> None:
         await self._http.aclose()
 
@@ -226,6 +334,51 @@ def _fmt_clients(clients: list[dict]) -> str:
         name = c.get("client", {}).get("clientName") or c.get("clientName", "?")
         status = c.get("clientStatus", "?")
         lines.append(f"{name} | status: {status}")
+    return "\n".join(lines)
+
+
+def _fmt_subclients(subs: list[dict]) -> str:
+    if not subs:
+        return "(no subclients found)"
+    lines = []
+    prev_client = None
+    for s in sorted(subs, key=lambda x: (x.get("clientName",""), x.get("appName",""), x.get("subclientName",""))):
+        if s.get("clientName") != prev_client:
+            lines.append(f"\n[{s.get('clientName')}]")
+            prev_client = s.get("clientName")
+        sp = s.get("storagePolicyName") or "—"
+        lines.append(f"  [{s.get('subclientId')}] {s.get('subclientName')} | {s.get('appName')} | bs:{s.get('backupsetName')} | sp:{sp}")
+    return "\n".join(lines).strip()
+
+
+def _fmt_schedule_policies(policies: list[dict]) -> str:
+    if not policies:
+        return "(no schedule policies found)"
+    lines = []
+    for p in sorted(policies, key=lambda x: x.get("taskName","")):
+        disabled = " [DISABLED]" if p.get("disabled") else ""
+        assoc = p.get("associatedObjects", 0)
+        apps = ",".join(str(a) for a in p.get("appTypeIds", []))
+        desc = p.get("description", "")
+        lines.append(f"[{p.get('taskId')}] {p.get('taskName')}{disabled} | apps:{apps} | assoc:{assoc} | {desc}")
+    return "\n".join(lines)
+
+
+def _fmt_client_jobs_summary(jobs: list[dict]) -> str:
+    if not jobs:
+        return "(no data)"
+    lines = []
+    for j in jobs:
+        client = (j.get("subclient") or {}).get("clientName") or "?"
+        status = j.get("status", "?")
+        jtype = j.get("jobType", "?")
+        start = j.get("jobStartTime", 0)
+        reason = j.get("pendingReason") or j.get("failureReason") or ""
+        line = f"{client:40s} | {status:10s} | {jtype} | [{j.get('jobId')}]"
+        if reason:
+            short = reason[:100].replace("<br>", " ")
+            line += f"\n    {short}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -366,6 +519,82 @@ async def list_tools() -> list[Tool]:
             description="List MediaAgents and their status (online/offline).",
             inputSchema={"type": "object", "properties": {}},
         ),
+        Tool(
+            name="list_subclients",
+            description=(
+                "List subclients (backup groups) for one or all clients. "
+                "Filter by client name and/or application type (e.g. 'Virtual Server', 'File System', 'SQL Server'). "
+                "Returns subclient name, backupset, app type, storage policy."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "client_name": {
+                        "type": "string",
+                        "description": "Filter by client name (partial match). Leave empty to list all.",
+                    },
+                    "app_type": {
+                        "type": "string",
+                        "description": "Filter by application type, e.g. 'Virtual Server', 'File System', 'SQL Server'.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="list_schedule_policies",
+            description=(
+                "List schedule policies configured in CommCell. "
+                "Filter by name or application type ID (106=Virtual Server, 33=File System, 81=SQL Server). "
+                "Returns policy name, description, associated object count, schedule summary."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name_filter": {
+                        "type": "string",
+                        "description": "Filter by policy name (partial match).",
+                    },
+                    "app_type_id": {
+                        "type": "integer",
+                        "description": "Filter by app type ID: 106=Virtual Server, 33=File System, 81=SQL Server.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_schedule_policy_details",
+            description=(
+                "Get full schedule details for a specific policy by taskId: "
+                "all sub-tasks with their cron-style descriptions and backup levels."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Schedule policy task ID (from list_schedule_policies).",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        ),
+        Tool(
+            name="get_client_jobs_summary",
+            description=(
+                "Summary of the latest backup job per client over a time window. "
+                "Shows which clients have recent successful/failed/running backups at a glance."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours_back": {
+                        "type": "integer",
+                        "default": 48,
+                        "description": "How many hours back to look (default 48).",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -408,6 +637,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "get_media_agents":
         agents = await client.get_media_agents()
         return [TextContent(type="text", text=_fmt_agents(agents))]
+
+    if name == "list_subclients":
+        subs = await client.list_subclients(
+            client_name=arguments.get("client_name", ""),
+            app_type=arguments.get("app_type", ""),
+        )
+        return [TextContent(type="text", text=_fmt_subclients(subs))]
+
+    if name == "list_schedule_policies":
+        policies = await client.list_schedule_policies(
+            name_filter=arguments.get("name_filter", ""),
+            app_type_id=arguments.get("app_type_id", 0),
+        )
+        return [TextContent(type="text", text=_fmt_schedule_policies(policies))]
+
+    if name == "get_schedule_policy_details":
+        details = await client.get_schedule_policy_details(arguments["task_id"])
+        import json
+        return [TextContent(type="text", text=json.dumps(details, indent=2, ensure_ascii=False))]
+
+    if name == "get_client_jobs_summary":
+        jobs = await client.get_client_jobs_summary(
+            hours_back=arguments.get("hours_back", 48),
+        )
+        return [TextContent(type="text", text=_fmt_client_jobs_summary(jobs))]
 
     raise ValueError(f"Unknown tool: {name}")
 
