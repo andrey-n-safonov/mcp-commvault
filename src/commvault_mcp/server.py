@@ -109,7 +109,8 @@ class CommvaultClient:
     async def list_jobs(
         self,
         client_name: str = "",
-        status: str = "",
+        job_type: str = "",
+        status_filter: str = "",
         hours_back: int = 24,
         limit: int = 50,
     ) -> list[dict]:
@@ -119,11 +120,15 @@ class CommvaultClient:
         }
         if client_name:
             params["clientName"] = client_name
-        if status:
-            params["jobFilter"] = status
+        if job_type:
+            params["jobFilter"] = job_type  # Backup or Restore
 
         data = await self._get("/Job", params)
-        return [item["jobSummary"] for item in data.get("jobs", []) if "jobSummary" in item]
+        jobs = [item["jobSummary"] for item in data.get("jobs", []) if "jobSummary" in item]
+
+        if status_filter:
+            jobs = [j for j in jobs if j.get("status", "").lower() == status_filter.lower()]
+        return jobs
 
     async def get_job_details(self, job_id: int) -> dict:
         data = await self._get(f"/Job/{job_id}")
@@ -257,7 +262,7 @@ async def list_tools() -> list[Tool]:
             name="list_jobs",
             description=(
                 "List Commvault backup/restore jobs. "
-                "Filter by client name, status, and time window. "
+                "Filter by client name, job type, status, and time window. "
                 "Returns job ID, client, subclient, status, and failure reason."
             ),
             inputSchema={
@@ -267,10 +272,15 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Filter by client name (partial match supported by CommServer).",
                     },
-                    "status": {
+                    "job_type": {
                         "type": "string",
-                        "enum": ["", "Backup", "Restore", "Running", "Completed", "Failed", "Pending", "Waiting"],
-                        "description": "Filter by job type or status. Leave empty for all.",
+                        "enum": ["", "Backup", "Restore"],
+                        "description": "Filter by operation type. Leave empty for all.",
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["", "Running", "Completed", "Failed", "Pending", "Waiting", "Suspended"],
+                        "description": "Filter by job status (client-side). Leave empty for all.",
                     },
                     "hours_back": {
                         "type": "integer",
@@ -366,7 +376,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "list_jobs":
         jobs = await client.list_jobs(
             client_name=arguments.get("client_name", ""),
-            status=arguments.get("status", ""),
+            job_type=arguments.get("job_type", ""),
+            status_filter=arguments.get("status_filter", ""),
             hours_back=arguments.get("hours_back", 24),
             limit=arguments.get("limit", 50),
         )
