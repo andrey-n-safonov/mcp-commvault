@@ -169,11 +169,23 @@ class CommvaultClient:
         data = await self._get("/Client", params)
         clients = data.get("clientProperties", [])
         if not isinstance(clients, list):
-            # sometimes wrapped differently
             clients = data.get("Client", {}).get("clientSummary", [])
 
+        if name_filter:
+            needle = name_filter.lower()
+            clients = [
+                c for c in clients
+                if isinstance(c, dict)
+                and needle in (c.get("client", {}).get("clientName") or c.get("clientName", "")).lower()
+            ]
+
         if not show_offline:
-            clients = [c for c in clients if c.get("clientFlags", {}).get("clientActivityControl", {}).get("activityControlOptions", [{}])[0].get("enableActivityType", True) if isinstance(c, dict)]
+            clients = [
+                c for c in clients
+                if isinstance(c, dict)
+                and c.get("clientFlags", {}).get("clientActivityControl", {})
+                   .get("activityControlOptions", [{}])[0].get("enableActivityType", True)
+            ]
 
         return clients
 
