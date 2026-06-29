@@ -119,16 +119,25 @@ class CommvaultClient:
             "limit": limit,
         }
         if client_name:
-            params["clientName"] = client_name
+            # server-side hint may be ignored; bump limit to avoid cutoff before client filter
+            params["limit"] = max(limit, 500)
         if job_type:
             params["jobFilter"] = job_type  # Backup or Restore
 
         data = await self._get("/Job", params)
         jobs = [item["jobSummary"] for item in data.get("jobs", []) if "jobSummary" in item]
 
+        if client_name:
+            needle = client_name.lower()
+            jobs = [
+                j for j in jobs
+                if needle in ((j.get("subclient") or {}).get("clientName") or "").lower()
+                or needle in (j.get("clientName") or "").lower()
+            ]
+
         if status_filter:
             jobs = [j for j in jobs if j.get("status", "").lower() == status_filter.lower()]
-        return jobs
+        return jobs[:limit]
 
     async def get_job_details(self, job_id: int) -> dict:
         data = await self._get(f"/Job/{job_id}")
